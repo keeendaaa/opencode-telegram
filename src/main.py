@@ -115,11 +115,16 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         token_storage = InMemoryTokenStorage()  # TODO: Use database storage
         providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
 
-    # Fall back to allowing all users in development mode
-    if not providers and config.development_mode:
+    # Only allow all users when explicitly requested. This grants remote access
+    # to the approved directory and must never be an implicit development default.
+    if (
+        not providers
+        and config.development_mode
+        and config.allow_all_users_in_development
+    ):
         logger.warning(
             "No auth providers configured"
-            " - creating development-only allow-all provider"
+            " - creating explicit development allow-all provider"
         )
         providers.append(WhitelistAuthProvider([], allow_all_dev=True))
     elif not providers:

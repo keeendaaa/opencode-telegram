@@ -322,6 +322,13 @@ class Settings(BaseSettings):
     # Development
     debug: bool = Field(False, description="Enable debug mode")
     development_mode: bool = Field(False, description="Enable development features")
+    allow_all_users_in_development: bool = Field(
+        False,
+        description=(
+            "Explicitly allow every Telegram user in development mode. "
+            "Dangerous: grants remote workspace access to anyone who can message the bot."
+        ),
+    )
 
     # Webhook settings (optional)
     webhook_url: Optional[str] = Field(None, description="Webhook URL for bot")

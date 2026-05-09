@@ -79,6 +79,10 @@ APPROVED_DIRECTORY=/Users/yourname/projects
 ALLOWED_USERS=123456789  # Your Telegram user ID
 ```
 
+`ALLOWED_USERS` is a security boundary. Do not leave it empty on any machine
+with access to real projects: the bot can read and modify files under
+`APPROVED_DIRECTORY` through OpenCode.
+
 ### 4. Run
 
 ```bash
@@ -224,6 +228,11 @@ TELEGRAM_BOT_USERNAME=...        # Your bot's username
 APPROVED_DIRECTORY=...           # Base directory for project access
 ALLOWED_USERS=123456789          # Comma-separated Telegram user IDs
 ```
+
+If `ALLOWED_USERS` is empty, startup fails by default. There is an explicit
+development escape hatch, `ALLOW_ALL_USERS_IN_DEVELOPMENT=true`, but it should
+only be used in isolated test environments because anyone who can message the
+bot gets remote access to `APPROVED_DIRECTORY`.
 
 ### Common Options
 

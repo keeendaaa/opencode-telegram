@@ -64,10 +64,43 @@ class Settings(BaseSettings):
     )
     disable_tool_validation: bool = Field(
         False,
-        description="Allow all Claude tools by bypassing tool validation checks",
+        description="Allow all agent tools by bypassing tool validation checks",
     )
 
-    # Claude settings
+    # OpenCode settings
+    opencode_cli_path: Optional[str] = Field(
+        None, description="Path to OpenCode CLI executable"
+    )
+    opencode_server_host: str = Field(
+        "127.0.0.1", description="Host for local opencode serve instances"
+    )
+    opencode_server_port: Optional[int] = Field(
+        None,
+        description=(
+            "Port for opencode serve. Leave empty to allocate one port per project."
+        ),
+    )
+    opencode_server_username: str = Field(
+        "opencode", description="Basic auth username for opencode serve"
+    )
+    opencode_server_password: Optional[str] = Field(
+        None,
+        description=(
+            "Basic auth password for opencode serve. Generated per server if unset."
+        ),
+    )
+    opencode_model: Optional[str] = Field(
+        None, description="OpenCode model in provider/model format"
+    )
+    opencode_agent: Optional[str] = Field(None, description="OpenCode agent to use")
+    opencode_timeout_seconds: int = Field(
+        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="OpenCode request timeout"
+    )
+    opencode_start_timeout: float = Field(
+        15.0, description="Seconds to wait for opencode serve startup", ge=1.0
+    )
+
+    # Legacy Claude settings kept for compatibility with existing storage/tests.
     claude_binary_path: Optional[str] = Field(
         None, description="Path to Claude CLI binary (deprecated)"
     )
@@ -452,6 +485,21 @@ class Settings(BaseSettings):
     @classmethod
     def validate_project_threads_chat_id(cls, v: Any) -> Optional[int]:
         """Allow empty chat ID for private mode by treating blank values as None."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return None
+            return int(value)
+        if isinstance(v, int):
+            return v
+        return v  # type: ignore[no-any-return]
+
+    @field_validator("opencode_server_port", mode="before")
+    @classmethod
+    def validate_opencode_server_port(cls, v: Any) -> Optional[int]:
+        """Allow an empty OpenCode port to mean auto-allocate."""
         if v is None:
             return None
         if isinstance(v, str):

@@ -1,15 +1,15 @@
-# Claude Code Telegram Bot
+# OpenCode Telegram Bot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
-A Telegram bot that gives you remote access to [Claude Code](https://claude.ai/code). Chat naturally with Claude about your projects from anywhere -- no terminal commands needed.
+A Telegram bot that gives you remote access to [OpenCode](https://opencode.ai/). Chat naturally with an agent about your projects from anywhere -- no terminal commands needed.
 
 ## What is this?
 
-This bot connects Telegram to Claude Code, providing a conversational AI interface for your codebase:
+This bot connects Telegram to OpenCode, providing a conversational AI interface for your codebase:
 
-- **Chat naturally** -- ask Claude to analyze, edit, or explain your code in plain language
+- **Chat naturally** -- ask OpenCode to analyze, edit, or explain your code in plain language
 - **Maintain context** across conversations with automatic session persistence per project
 - **Code on the go** from any device with Telegram
 - **Receive proactive notifications** from webhooks, scheduled jobs, and CI/CD events
@@ -23,7 +23,7 @@ This bot connects Telegram to Claude Code, providing a conversational AI interfa
 You: Can you help me add error handling to src/api.py?
 
 Bot: I'll analyze src/api.py and add error handling...
-     [Claude reads your code, suggests improvements, and can apply changes directly]
+     [OpenCode reads your code, suggests improvements, and can apply changes directly]
 
 You: Looks good. Now run the tests to make sure nothing broke.
 
@@ -34,7 +34,7 @@ Bot: Running pytest...
 ### 1. Prerequisites
 
 - **Python 3.11+** -- [Download here](https://www.python.org/downloads/)
-- **Claude Code CLI** -- [Install from here](https://claude.ai/code)
+- **OpenCode CLI** -- [Install from here](https://opencode.ai/docs/)
 - **Telegram Bot Token** -- Get one from [@BotFather](https://t.me/botfather)
 
 ### 2. Install
@@ -45,24 +45,24 @@ Choose your preferred method:
 
 ```bash
 # Using uv (recommended — installs in an isolated environment)
-uv tool install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+uv tool install git+https://github.com/keeendaaa/opencode-telegram
 
 # Or using pip
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+pip install git+https://github.com/keeendaaa/opencode-telegram
 
 # Track the latest stable release
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@latest
+pip install git+https://github.com/keeendaaa/opencode-telegram
 ```
 
 #### Option B: From source (for development)
 
 ```bash
-git clone https://github.com/RichardAtCT/claude-code-telegram.git
-cd claude-code-telegram
+git clone https://github.com/keeendaaa/opencode-telegram.git
+cd opencode-telegram
 make dev  # requires Poetry
 ```
 
-> **Note:** Always install from a tagged release (not `main`) for stability. See [Releases](https://github.com/RichardAtCT/claude-code-telegram/releases) for available versions.
+> **Note:** This fork uses local `opencode serve` instances behind the Telegram bot.
 
 ### 3. Configure
 
@@ -74,7 +74,7 @@ cp .env.example .env
 **Minimum required:**
 ```bash
 TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-TELEGRAM_BOT_USERNAME=my_claude_bot
+TELEGRAM_BOT_USERNAME=my_opencode_bot
 APPROVED_DIRECTORY=/Users/yourname/projects
 ALLOWED_USERS=123456789  # Your Telegram user ID
 ```
@@ -88,7 +88,7 @@ make run-debug    # With debug logging
 
 Message your bot on Telegram to get started.
 
-> **Detailed setup:** See [docs/setup.md](docs/setup.md) for Claude authentication options and troubleshooting.
+> **Detailed setup:** Install OpenCode and run `opencode auth login` before starting the bot.
 
 ## Modes
 

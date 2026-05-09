@@ -136,12 +136,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
     audit_logger = AuditLogger(audit_storage)
 
-    # Create Claude integration components with persistent storage
+    # Create agent integration components with persistent storage
     session_storage = SQLiteSessionStorage(storage.db_manager)
     session_manager = SessionManager(config, session_storage)
 
-    # Create Claude SDK manager and integration facade
-    logger.info("Using Claude Python SDK integration")
+    # Create OpenCode server manager behind the existing integration facade
+    logger.info("Using OpenCode server integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
 
     claude_integration = ClaudeIntegration(

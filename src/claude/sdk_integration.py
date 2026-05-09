@@ -1,54 +1,34 @@
-"""Claude Code Python SDK integration."""
+"""OpenCode server integration.
+
+This module intentionally keeps the historical Claude* class names because the
+rest of the bot uses them as its agent integration contract. Internally, the
+implementation talks to a local ``opencode serve`` HTTP server.
+"""
 
 import asyncio
+import json
 import os
+import secrets
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+import httpx
 import structlog
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ClaudeSDKError,
-    CLIConnectionError,
-    CLIJSONDecodeError,
-    CLINotFoundError,
-    Message,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ProcessError,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolPermissionContext,
-    ToolUseBlock,
-    UserMessage,
-)
-from claude_agent_sdk._errors import MessageParseError
-from claude_agent_sdk._internal.message_parser import parse_message
-from claude_agent_sdk.types import StreamEvent
 
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
-from .exceptions import (
-    ClaudeMCPError,
-    ClaudeParsingError,
-    ClaudeProcessError,
-    ClaudeTimeoutError,
-)
-from .monitor import _is_claude_internal_path, check_bash_directory_boundary
+from .exceptions import ClaudeParsingError, ClaudeProcessError, ClaudeTimeoutError
 
 logger = structlog.get_logger()
 
-# Fallback message when Claude produces no text but did use tools.
-TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+TASK_COMPLETED_MSG = "Task completed. Tools used: {tools_summary}"
 
 
 @dataclass
 class ClaudeResponse:
-    """Response from Claude Code SDK."""
+    """Response from the agent backend."""
 
     content: str
     session_id: str
@@ -63,9 +43,9 @@ class ClaudeResponse:
 
 @dataclass
 class StreamUpdate:
-    """Streaming update from Claude SDK."""
+    """Streaming/progress update normalized for bot handlers."""
 
-    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
+    type: str
     content: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -74,18 +54,15 @@ class StreamUpdate:
     def get_tool_names(self) -> List[str]:
         """Return tool names from the stream payload."""
         names: List[str] = []
-
         if self.tool_calls:
             for tool_call in self.tool_calls:
                 name = tool_call.get("name") if isinstance(tool_call, dict) else None
                 if isinstance(name, str) and name:
                     names.append(name)
-
         if self.metadata:
             tool_name = self.metadata.get("tool_name")
             if isinstance(tool_name, str) and tool_name:
                 names.append(tool_name)
-
             metadata_tools = self.metadata.get("tools")
             if isinstance(metadata_tools, list):
                 for tool in metadata_tools:
@@ -95,36 +72,28 @@ class StreamUpdate:
                         name = tool
                     else:
                         name = None
-
                     if isinstance(name, str) and name:
                         names.append(name)
-
-        # Preserve insertion order while de-duplicating.
         return list(dict.fromkeys(names))
 
     def is_error(self) -> bool:
         """Check whether this stream update represents an error."""
         if self.type == "error":
             return True
-
         if self.metadata:
             if self.metadata.get("is_error") is True:
                 return True
             status = self.metadata.get("status")
             if isinstance(status, str) and status.lower() == "error":
                 return True
-            error_val = self.metadata.get("error")
-            if isinstance(error_val, str) and error_val:
-                return True
-            error_msg_val = self.metadata.get("error_message")
-            if isinstance(error_msg_val, str) and error_msg_val:
-                return True
-
+            for key in ("error", "error_message"):
+                value = self.metadata.get(key)
+                if isinstance(value, str) and value:
+                    return True
         if self.progress:
             status = self.progress.get("status")
             if isinstance(status, str) and status.lower() == "error":
                 return True
-
         return False
 
     def get_error_message(self) -> str:
@@ -134,15 +103,12 @@ class StreamUpdate:
                 value = self.metadata.get(key)
                 if isinstance(value, str) and value.strip():
                     return value
-
         if isinstance(self.content, str) and self.content.strip():
             return self.content
-
         if self.progress:
             value = self.progress.get("error")
             if isinstance(value, str) and value.strip():
                 return value
-
         return "Unknown error"
 
     def get_progress_percentage(self) -> Optional[int]:
@@ -163,110 +129,41 @@ class StreamUpdate:
                 percentage = _to_int(self.progress.get(key))
                 if percentage is not None:
                     return max(0, min(100, percentage))
-
             step = _to_int(self.progress.get("step"))
             total_steps = _to_int(self.progress.get("total_steps"))
             if step is not None and total_steps and total_steps > 0:
                 return max(0, min(100, int((step / total_steps) * 100)))
-
         if self.metadata:
             percentage = _to_int(self.metadata.get("progress_percentage"))
             if percentage is not None:
                 return max(0, min(100, percentage))
-
         return None
 
 
-def _make_can_use_tool_callback(
-    security_validator: SecurityValidator,
-    working_directory: Path,
-    approved_directory: Path,
-) -> Any:
-    """Create a can_use_tool callback for SDK-level tool permission validation.
+@dataclass
+class _OpenCodeServer:
+    """Running opencode server metadata."""
 
-    The callback validates file path boundaries and bash directory boundaries
-    *before* the SDK executes the tool, providing preventive security enforcement.
-    """
-    _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
-    _BASH_TOOLS = {"Bash", "bash", "shell"}
-
-    async def can_use_tool(
-        tool_name: str,
-        tool_input: Dict[str, Any],
-        context: ToolPermissionContext,
-    ) -> Any:
-        # File path validation
-        if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
-            if file_path:
-                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
-                if _is_claude_internal_path(file_path):
-                    return PermissionResultAllow()
-
-                valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied file operation",
-                        tool_name=tool_name,
-                        file_path=file_path,
-                        error=error,
-                    )
-                    return PermissionResultDeny(message=error or "Invalid file path")
-
-        # Bash directory boundary validation
-        if tool_name in _BASH_TOOLS:
-            command = tool_input.get("command", "")
-            if command:
-                valid, error = check_bash_directory_boundary(
-                    command, working_directory, approved_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied bash command",
-                        tool_name=tool_name,
-                        command=command,
-                        error=error,
-                    )
-                    return PermissionResultDeny(
-                        message=error or "Bash directory boundary violation"
-                    )
-
-        return PermissionResultAllow()
-
-    return can_use_tool
+    cwd: Path
+    base_url: str
+    username: str
+    password: str
+    process: asyncio.subprocess.Process
 
 
 class ClaudeSDKManager:
-    """Manage Claude Code SDK integration."""
+    """Manage OpenCode server integration."""
 
     def __init__(
         self,
         config: Settings,
         security_validator: Optional[SecurityValidator] = None,
     ):
-        """Initialize SDK manager with configuration."""
+        """Initialize OpenCode manager with configuration."""
         self.config = config
         self.security_validator = security_validator
-
-        # Set up environment for Claude Code SDK if API key is provided
-        # If no API key is provided, the SDK will use existing CLI authentication
-        if config.anthropic_api_key_str:
-            os.environ["ANTHROPIC_API_KEY"] = config.anthropic_api_key_str
-            logger.info("Using provided API key for Claude SDK authentication")
-        else:
-            logger.info("No API key provided, using existing Claude CLI authentication")
-
-    def _is_retryable_error(self, exc: BaseException) -> bool:
-        """Return True for transient errors that warrant a retry.
-        asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
-        Only non-MCP CLIConnectionError is considered transient.
-        """
-        if isinstance(exc, CLIConnectionError):
-            msg = str(exc).lower()
-            return "mcp" not in msg  # "server" alone is too broad
-        return False
+        self._servers: Dict[str, _OpenCodeServer] = {}
+        self._lock = asyncio.Lock()
 
     async def execute_command(
         self,
@@ -274,494 +171,386 @@ class ClaudeSDKManager:
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        stream_callback: Optional[Callable[[StreamUpdate], Any]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
-        """Execute Claude Code command via SDK."""
+        """Execute an agent prompt through ``opencode serve``."""
         start_time = asyncio.get_event_loop().time()
+        working_directory = working_directory.resolve()
 
         logger.info(
-            "Starting Claude SDK command",
+            "Starting OpenCode command",
             working_directory=str(working_directory),
             session_id=session_id,
             continue_session=continue_session,
         )
 
         try:
-            # Capture stderr from Claude CLI for better error diagnostics
-            stderr_lines: List[str] = []
+            server = await self._get_server(working_directory)
+            async with self._client(server) as client:
+                final_session_id = session_id if session_id and continue_session else None
+                if not final_session_id:
+                    final_session_id = await self._create_session(client, prompt)
 
-            def _stderr_callback(line: str) -> None:
-                stderr_lines.append(line)
-                logger.debug("Claude CLI stderr", line=line)
-
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
-            )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
+                body = self._build_message_body(prompt, images)
+                message_task = asyncio.create_task(
+                    self._post_message(client, final_session_id, body)
                 )
+                interrupt_task: Optional[asyncio.Task[None]] = None
+                interrupted = False
 
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
-            else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
-
-            # Build Claude Agent options
-            options = ClaudeAgentOptions(
-                max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
-                max_budget_usd=self.config.claude_max_cost_per_request,
-                cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
-                cli_path=self.config.claude_cli_path or None,
-                include_partial_messages=stream_callback is not None,
-                sandbox={
-                    "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                },
-                system_prompt=base_prompt,
-                setting_sources=["project"],
-                stderr=_stderr_callback,
-            )
-
-            # Pass MCP server configuration if enabled
-            if self.config.enable_mcp and self.config.mcp_config_path:
-                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
-                logger.info(
-                    "MCP servers configured",
-                    mcp_config_path=str(self.config.mcp_config_path),
-                )
-
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                )
-
-            # Resume previous session if we have a session_id
-            if session_id and continue_session:
-                options.resume = session_id
-                logger.info(
-                    "Resuming previous session",
-                    session_id=session_id,
-                )
-
-            # Collect messages via ClaudeSDKClient
-            messages: List[Message] = []
-            interrupted = False
-
-            async def _run_client() -> None:
-                client = ClaudeSDKClient(options)
-                try:
-                    await client.connect()
-
-                    if images:
-                        content_blocks: List[Dict[str, Any]] = []
-                        for img in images:
-                            media_type = img.get("media_type", "image/png")
-                            content_blocks.append(
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": img["data"],
-                                    },
-                                }
-                            )
-                        content_blocks.append({"type": "text", "text": prompt})
-
-                        multimodal_msg = {
-                            "type": "user",
-                            "message": {
-                                "role": "user",
-                                "content": content_blocks,
-                            },
-                        }
-
-                        async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
-                            yield multimodal_msg
-
-                        await client.query(_multimodal_prompt())
-                    else:
-                        await client.query(prompt)
-
-                    async for raw_data in client._query.receive_messages():
-                        try:
-                            message = parse_message(raw_data)
-                        except MessageParseError as e:
-                            logger.debug(
-                                "Skipping unparseable message",
-                                error=str(e),
-                            )
-                            continue
-
-                        messages.append(message)
-
-                        if isinstance(message, ResultMessage):
-                            break
-
-                        # Handle streaming callback
-                        if stream_callback:
-                            try:
-                                await self._handle_stream_message(
-                                    message, stream_callback
-                                )
-                            except Exception as callback_error:
-                                logger.warning(
-                                    "Stream callback failed",
-                                    error=str(callback_error),
-                                    error_type=type(callback_error).__name__,
-                                )
-                finally:
-                    await client.disconnect()
-
-            # Execute with timeout and retry, racing against optional interrupt
-            max_attempts = max(1, self.config.claude_retry_max_attempts)
-            last_exc: Optional[BaseException] = None
-
-            for attempt in range(max_attempts):
-                # Reset message accumulator each attempt so that a failed attempt
-                # does not pollute the next one with partial/duplicate messages.
-                # _run_client() closes over `messages` by reference (late-binding
-                # closure), so clearing it here is seen by every new call.
-                messages.clear()
-
-                if attempt > 0:
-                    delay = min(
-                        self.config.claude_retry_base_delay
-                        * (self.config.claude_retry_backoff_factor ** (attempt - 1)),
-                        self.config.claude_retry_max_delay,
-                    )
-                    logger.warning(
-                        "Retrying Claude SDK command",
-                        attempt=attempt + 1,
-                        max_attempts=max_attempts,
-                        delay_seconds=delay,
-                    )
-                    await asyncio.sleep(delay)
-
-                run_task = asyncio.create_task(_run_client())
-
-                interrupt_watcher: Optional["asyncio.Task[None]"] = None
                 if interrupt_event is not None:
 
-                    async def _cancel_on_interrupt() -> None:
-                        nonlocal interrupted
+                    async def _abort_on_interrupt() -> None:
                         await interrupt_event.wait()
-                        interrupted = True
-                        run_task.cancel()
+                        await self._abort_session(client, final_session_id)
 
-                    interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
+                    interrupt_task = asyncio.create_task(_abort_on_interrupt())
 
-                # Note: asyncio.TimeoutError is intentionally NOT retried —
-                # it reflects a user-configured hard limit.
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(run_task),
-                        timeout=self.config.claude_timeout_seconds,
-                    )
-                    break  # success — exit retry loop
-                except asyncio.CancelledError:
-                    if not interrupted:
-                        raise
-                    # Interrupt cancelled the task — wait for cleanup
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
-                    break  # user interrupted — don't retry
-                except asyncio.TimeoutError:
-                    run_task.cancel()
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
-                    raise  # timeout — don't retry
-                except CLIConnectionError as exc:
-                    if self._is_retryable_error(exc) and attempt < max_attempts - 1:
-                        last_exc = exc
-                        logger.warning(
-                            "Transient connection error, will retry",
-                            attempt=attempt + 1,
-                            error=str(exc),
+                    if interrupt_task is None:
+                        response_data = await asyncio.wait_for(
+                            message_task,
+                            timeout=self.config.opencode_timeout_seconds,
                         )
-                        continue
-                    raise  # non-retryable or attempts exhausted
+                    else:
+                        done, _pending = await asyncio.wait(
+                            {message_task, interrupt_task},
+                            timeout=self.config.opencode_timeout_seconds,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            message_task.cancel()
+                            await self._abort_session(client, final_session_id)
+                            raise asyncio.TimeoutError
+                        if interrupt_task in done:
+                            interrupted = True
+                            message_task.cancel()
+                            response_data = {}
+                        else:
+                            response_data = await message_task
                 finally:
-                    if interrupt_watcher is not None:
-                        interrupt_watcher.cancel()
-            else:
-                if last_exc is not None:
-                    raise last_exc
+                    if interrupt_task is not None:
+                        interrupt_task.cancel()
 
-            # Extract cost, tools, and session_id from result message
-            cost = 0.0
-            tools_used: List[Dict[str, Any]] = []
-            claude_session_id = None
-            result_content = None
-            for message in messages:
-                if isinstance(message, ResultMessage):
-                    cost = getattr(message, "total_cost_usd", 0.0) or 0.0
-                    claude_session_id = getattr(message, "session_id", None)
-                    result_content = getattr(message, "result", None)
-                    current_time = asyncio.get_event_loop().time()
-                    for msg in messages:
-                        if isinstance(msg, AssistantMessage):
-                            msg_content = getattr(msg, "content", [])
-                            if msg_content and isinstance(msg_content, list):
-                                for block in msg_content:
-                                    if isinstance(block, ToolUseBlock):
-                                        tools_used.append(
-                                            {
-                                                "name": getattr(
-                                                    block, "name", "unknown"
-                                                ),
-                                                "timestamp": current_time,
-                                                "input": getattr(block, "input", {}),
-                                            }
-                                        )
-                    break
+                content = self._extract_text(response_data).strip()
+                tools_used = self._extract_tools(response_data)
+                if not content and tools_used:
+                    tool_names = [tool["name"] for tool in tools_used if tool.get("name")]
+                    content = TASK_COMPLETED_MSG.format(
+                        tools_summary=", ".join(list(dict.fromkeys(tool_names)))
+                    )
+                if interrupted and not content:
+                    content = "Request stopped."
 
-            # Fallback: extract session_id from StreamEvent messages if
-            # ResultMessage didn't provide one (can happen with some CLI versions)
-            if not claude_session_id:
-                for message in messages:
-                    msg_session_id = getattr(message, "session_id", None)
-                    if msg_session_id and not isinstance(message, ResultMessage):
-                        claude_session_id = msg_session_id
-                        logger.info(
-                            "Got session ID from stream event (fallback)",
-                            session_id=claude_session_id,
+                if stream_callback and (content or tools_used):
+                    await stream_callback(
+                        StreamUpdate(
+                            type="assistant",
+                            content=content or None,
+                            tool_calls=tools_used or None,
                         )
-                        break
+                    )
 
-            # Calculate duration
-            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
-
-            # Use Claude's session_id if available, otherwise fall back
-            final_session_id = claude_session_id or session_id or ""
-
-            if claude_session_id and claude_session_id != session_id:
-                logger.info(
-                    "Got session ID from Claude",
-                    claude_session_id=claude_session_id,
-                    previous_session_id=session_id,
+                duration_ms = int(
+                    (asyncio.get_event_loop().time() - start_time) * 1000
                 )
-
-            # Use ResultMessage.result if available, fall back to message extraction
-            if result_content is not None:
-                content = str(result_content).strip()
-            else:
-                content_parts = []
-                for msg in messages:
-                    if isinstance(msg, AssistantMessage):
-                        msg_content = getattr(msg, "content", [])
-                        if msg_content and isinstance(msg_content, list):
-                            for block in msg_content:
-                                if hasattr(block, "text"):
-                                    content_parts.append(block.text)
-                        elif msg_content:
-                            content_parts.append(str(msg_content))
-                content = "\n".join(content_parts).strip()
-
-            if not content and tools_used:
-                tool_names = [
-                    tool.get("name", "")
-                    for tool in tools_used
-                    if isinstance(tool.get("name"), str) and tool.get("name")
-                ]
-                unique_tool_names = list(dict.fromkeys(tool_names))
-                tools_summary = ", ".join(unique_tool_names) or "unknown"
-                content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
-
-            return ClaudeResponse(
-                content=content,
-                session_id=final_session_id,
-                cost=cost,
-                duration_ms=duration_ms,
-                num_turns=len(
-                    [
-                        m
-                        for m in messages
-                        if isinstance(m, (UserMessage, AssistantMessage))
-                    ]
-                ),
-                tools_used=tools_used,
-                interrupted=interrupted,
-            )
+                return ClaudeResponse(
+                    content=content,
+                    session_id=final_session_id,
+                    cost=0.0,
+                    duration_ms=duration_ms,
+                    num_turns=1,
+                    tools_used=tools_used,
+                    interrupted=interrupted,
+                )
 
         except asyncio.TimeoutError:
             logger.error(
-                "Claude SDK command timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
+                "OpenCode command timed out",
+                timeout_seconds=self.config.opencode_timeout_seconds,
             )
             raise ClaudeTimeoutError(
-                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
+                f"OpenCode timed out after {self.config.opencode_timeout_seconds}s"
             )
-
-        except CLINotFoundError as e:
-            logger.error("Claude CLI not found", error=str(e))
-            error_msg = (
-                "Claude Code not found. Please ensure Claude is installed:\n"
-                "  npm install -g @anthropic-ai/claude-code\n\n"
-                "If already installed, try one of these:\n"
-                "  1. Add Claude to your PATH\n"
-                "  2. Create a symlink: ln -s $(which claude) /usr/local/bin/claude\n"
-                "  3. Set CLAUDE_CLI_PATH environment variable"
-            )
-            raise ClaudeProcessError(error_msg)
-
-        except ProcessError as e:
-            error_str = str(e)
-            # Include captured stderr for better diagnostics
-            captured_stderr = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
-            if captured_stderr:
-                error_str = f"{error_str}\nStderr: {captured_stderr}"
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:2000]
             logger.error(
-                "Claude process failed",
-                error=error_str,
-                exit_code=getattr(e, "exit_code", None),
-                stderr=captured_stderr or None,
+                "OpenCode HTTP error",
+                status_code=e.response.status_code,
+                detail=detail,
             )
-            # Check if the process error is MCP-related
-            if "mcp" in error_str.lower():
-                raise ClaudeMCPError(f"MCP server error: {error_str}")
-            raise ClaudeProcessError(f"Claude process error: {error_str}")
-
-        except CLIConnectionError as e:
-            error_str = str(e)
-            logger.error("Claude connection error", error=error_str)
-            # Check if the connection error is MCP-related
-            if "mcp" in error_str.lower() or "server" in error_str.lower():
-                raise ClaudeMCPError(f"MCP server connection failed: {error_str}")
-            raise ClaudeProcessError(f"Failed to connect to Claude: {error_str}")
-
-        except CLIJSONDecodeError as e:
-            logger.error("Claude SDK JSON decode error", error=str(e))
-            raise ClaudeParsingError(f"Failed to decode Claude response: {str(e)}")
-
-        except ClaudeSDKError as e:
-            logger.error("Claude SDK error", error=str(e))
-            raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
-
+            raise ClaudeProcessError(
+                f"OpenCode HTTP {e.response.status_code}: {detail}"
+            )
+        except httpx.HTTPError as e:
+            logger.error("OpenCode connection error", error=str(e))
+            raise ClaudeProcessError(f"Failed to connect to OpenCode: {e}")
+        except json.JSONDecodeError as e:
+            logger.error("OpenCode JSON decode error", error=str(e))
+            raise ClaudeParsingError(f"Failed to decode OpenCode response: {e}")
         except Exception as e:
-            exceptions = getattr(e, "exceptions", None)
-            if exceptions is not None:
-                # ExceptionGroup from TaskGroup operations (Python 3.11+)
-                logger.error(
-                    "Task group error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                    exception_count=len(exceptions),
-                    exceptions=[str(ex) for ex in exceptions[:3]],
-                )
-                raise ClaudeProcessError(
-                    f"Claude SDK task error: {exceptions[0] if exceptions else e}"
-                )
-
             logger.error(
-                "Unexpected error in Claude SDK",
+                "Unexpected OpenCode error",
                 error=str(e),
                 error_type=type(e).__name__,
             )
-            raise ClaudeProcessError(f"Unexpected error: {str(e)}")
+            raise ClaudeProcessError(f"Unexpected OpenCode error: {e}")
 
-    async def _handle_stream_message(
-        self, message: Message, stream_callback: Callable[[StreamUpdate], None]
-    ) -> None:
-        """Handle streaming message from claude-agent-sdk."""
-        try:
-            if isinstance(message, AssistantMessage):
-                # Extract content from assistant message
-                content = getattr(message, "content", [])
-                text_parts = []
-                tool_calls = []
+    async def _get_server(self, working_directory: Path) -> _OpenCodeServer:
+        key = str(working_directory)
+        async with self._lock:
+            existing = self._servers.get(key)
+            if existing and existing.process.returncode is None:
+                return existing
 
-                if content and isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, ToolUseBlock):
-                            tool_calls.append(
-                                {
-                                    "name": block.name,
-                                    "input": block.input,
-                                    "id": block.id,
-                                }
-                            )
-                        elif isinstance(block, TextBlock):
-                            text_parts.append(block.text)
-                        elif isinstance(block, ThinkingBlock):
-                            text_parts.append(block.thinking)
+            server = await self._start_server(working_directory)
+            self._servers[key] = server
+            return server
 
-                if text_parts or tool_calls:
-                    update = StreamUpdate(
-                        type="assistant",
-                        content=("\n".join(text_parts) if text_parts else None),
-                        tool_calls=tool_calls if tool_calls else None,
-                    )
-                    await stream_callback(update)
-                elif content:
-                    # Fallback for non-list content
-                    update = StreamUpdate(
-                        type="assistant",
-                        content=str(content),
-                    )
-                    await stream_callback(update)
+    async def _start_server(self, working_directory: Path) -> _OpenCodeServer:
+        port = self.config.opencode_server_port or self._find_free_port()
+        hostname = self.config.opencode_server_host
+        username = self.config.opencode_server_username
+        password = self.config.opencode_server_password or secrets.token_urlsafe(24)
+        base_url = f"http://{hostname}:{port}"
 
-            elif isinstance(message, StreamEvent):
-                event = message.event or {}
-                if event.get("type") == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text", "")
-                        if text:
-                            update = StreamUpdate(
-                                type="stream_delta",
-                                content=text,
-                            )
-                            await stream_callback(update)
+        env = os.environ.copy()
+        env["OPENCODE_SERVER_USERNAME"] = username
+        env["OPENCODE_SERVER_PASSWORD"] = password
+        env["OPENCODE_PERMISSION"] = json.dumps(self._permission_config())
 
-            elif isinstance(message, UserMessage):
-                content = getattr(message, "content", "")
-                if content:
-                    update = StreamUpdate(
-                        type="user",
-                        content=content,
-                    )
-                    await stream_callback(update)
-
-        except Exception as e:
-            logger.warning("Stream callback failed", error=str(e))
-
-    def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:
-        """Load MCP server configuration from a JSON file.
-
-        The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
-        """
-        import json
+        command = [
+            self.config.opencode_cli_path or "opencode",
+            "serve",
+            "--hostname",
+            hostname,
+            "--port",
+            str(port),
+        ]
+        logger.info("Starting OpenCode server", cwd=str(working_directory), port=port)
 
         try:
-            with open(config_path) as f:
-                config_data = json.load(f)
-            return config_data.get("mcpServers", {})
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(
-                "Failed to load MCP config", path=str(config_path), error=str(e)
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(working_directory),
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            return {}
+        except FileNotFoundError:
+            raise ClaudeProcessError(
+                "OpenCode CLI not found. Install it and/or set OPENCODE_CLI_PATH."
+            )
+
+        server = _OpenCodeServer(
+            cwd=working_directory,
+            base_url=base_url,
+            username=username,
+            password=password,
+            process=process,
+        )
+        await self._wait_until_ready(server)
+        return server
+
+    async def _wait_until_ready(self, server: _OpenCodeServer) -> None:
+        deadline = asyncio.get_event_loop().time() + self.config.opencode_start_timeout
+        last_error = ""
+        while asyncio.get_event_loop().time() < deadline:
+            if server.process.returncode is not None:
+                stderr = await self._read_process_stderr(server.process)
+                raise ClaudeProcessError(
+                    f"OpenCode server exited early with code "
+                    f"{server.process.returncode}: {stderr}"
+                )
+            try:
+                async with self._client(server, timeout=2.0) as client:
+                    response = await client.get("/global/health")
+                    if response.status_code == 200:
+                        return
+                    last_error = response.text[:500]
+            except httpx.HTTPError as e:
+                last_error = str(e)
+            await asyncio.sleep(0.2)
+        raise ClaudeTimeoutError(
+            f"OpenCode server did not become ready: {last_error or 'timeout'}"
+        )
+
+    def _client(
+        self, server: _OpenCodeServer, timeout: Optional[float] = None
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=server.base_url,
+            auth=(server.username, server.password),
+            timeout=timeout or self.config.opencode_timeout_seconds,
+        )
+
+    async def _create_session(self, client: httpx.AsyncClient, prompt: str) -> str:
+        title = prompt.strip().splitlines()[0][:80] or "Telegram session"
+        response = await client.post("/session", json={"title": title})
+        response.raise_for_status()
+        data = response.json()
+        session_id = data.get("id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ClaudeParsingError("OpenCode session create response has no id")
+        return session_id
+
+    async def _post_message(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        response = await client.post(f"/session/{session_id}/message", json=body)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ClaudeParsingError("OpenCode message response is not an object")
+        return data
+
+    async def _abort_session(
+        self, client: httpx.AsyncClient, session_id: str
+    ) -> None:
+        try:
+            response = await client.post(f"/session/{session_id}/abort")
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning("Failed to abort OpenCode session", error=str(e))
+
+    def _build_message_body(
+        self, prompt: str, images: Optional[List[Dict[str, str]]] = None
+    ) -> Dict[str, Any]:
+        system_prompt = (
+            f"All file operations must stay within {self.config.approved_directory}. "
+            "Use relative paths."
+        )
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+
+        # OpenCode server accepts structured parts, but image part details can vary
+        # between versions. Preserve image context as text for now rather than
+        # dropping it silently.
+        if images:
+            parts.append(
+                {
+                    "type": "text",
+                    "text": f"\n\nAttached images: {len(images)} image(s).",
+                }
+            )
+
+        body: Dict[str, Any] = {
+            "parts": parts,
+            "system": system_prompt,
+        }
+        model = self._model_payload(self.config.opencode_model)
+        if model:
+            body["model"] = model
+        if self.config.opencode_agent:
+            body["agent"] = self.config.opencode_agent
+        return body
+
+    def _model_payload(self, model: Optional[str]) -> Optional[Dict[str, str]]:
+        if not model:
+            return None
+        provider, sep, model_id = model.partition("/")
+        if not sep or not provider or not model_id:
+            logger.warning(
+                "Ignoring invalid OpenCode model, expected provider/model",
+                model=model,
+            )
+            return None
+        return {"providerID": provider, "modelID": model_id}
+
+    def _permission_config(self) -> Any:
+        if self.config.disable_tool_validation:
+            return "allow"
+        return {
+            "read": "allow",
+            "edit": "allow",
+            "bash": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "task": "allow",
+            "todowrite": "allow",
+            "webfetch": "allow",
+            "websearch": "allow",
+            "external_directory": "deny",
+            "doom_loop": "deny",
+        }
+
+    def _extract_text(self, data: Any) -> str:
+        chunks: List[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                value_type = value.get("type")
+                text = value.get("text")
+                if isinstance(text, str) and value_type in {"text", "step-start"}:
+                    chunks.append(text)
+                elif isinstance(text, str) and "parts" not in value:
+                    chunks.append(text)
+                for key in ("parts", "content", "children"):
+                    child = value.get(key)
+                    if child is not None:
+                        walk(child)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(data.get("parts", data) if isinstance(data, dict) else data)
+        return "\n".join(chunk for chunk in chunks if chunk.strip())
+
+    def _extract_tools(self, data: Any) -> List[Dict[str, Any]]:
+        tools: List[Dict[str, Any]] = []
+
+        def maybe_add(value: Dict[str, Any]) -> None:
+            value_type = str(value.get("type", "")).lower()
+            call = value.get("call") if isinstance(value.get("call"), dict) else {}
+            name = (
+                value.get("tool")
+                or value.get("toolID")
+                or value.get("toolId")
+                or value.get("name")
+                or call.get("tool")
+                or call.get("name")
+            )
+            if isinstance(name, str) and ("tool" in value_type or call):
+                tools.append(
+                    {
+                        "name": name,
+                        "input": value.get("input") or call.get("input") or {},
+                    }
+                )
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                maybe_add(value)
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(data)
+        unique: Dict[str, Dict[str, Any]] = {}
+        for idx, tool in enumerate(tools):
+            key = f"{tool.get('name')}:{idx}"
+            unique[key] = tool
+        return list(unique.values())
+
+    @staticmethod
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    @staticmethod
+    async def _read_process_stderr(process: asyncio.subprocess.Process) -> str:
+        if process.stderr is None:
+            return ""
+        try:
+            data = await asyncio.wait_for(process.stderr.read(4096), timeout=1)
+        except asyncio.TimeoutError:
+            return ""
+        return data.decode(errors="replace")
